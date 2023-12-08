@@ -1329,6 +1329,23 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(Block &block,
     return None;
 
   int64_t totalSizeInBytes = 0;
+  /* TODO: YUXUAN JIAQI: We need to get all AffineIfOp in the block and record the records in the following way:
+    {
+      "if1_cond": [region1, region2],
+      "if2_cond": [region1, region3],
+      "if3_cond": [region1, region2, region3],
+      ...
+    }
+
+    After this, we need to indentify the if conditions that are mutually exclusive.
+    We consider the mutully exclusive ifs as a whole by taking the maximum memory footprint among all ifs.
+
+    So in all there are two significant tasks:
+    1. Identify the if ops, get the regions in each if op, and record them in the above way.
+    2. Identify the mutually exclusive if ops, this would require some kind of analysis on the if conditions. I bet there are some existing analysis in MLIR that we can use.
+
+    The rest of the task is to take the maximum memory footprint among all mutually exclusive if ops, which is kinda straightforward.
+   */
   for (const auto &region : regions) {
     Optional<int64_t> size = region.second->getRegionSize();
     if (!size.hasValue())
