@@ -1329,7 +1329,7 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(Block &block,
     return None;
 
   int64_t totalSizeInBytes = 0;
-  /* TODO: YUXUAN JIAQI: We need to get all AffineIfOp in the block and record the records in the following way:
+  /* TODO: YUXUAN JIAQI: We need to get all `AffineIfOp` in the block and record the records in the following way:
     {
       "if1_cond": [region1, region2],
       "if2_cond": [region1, region3],
@@ -1346,6 +1346,48 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(Block &block,
 
     The rest of the task is to take the maximum memory footprint among all mutually exclusive if ops, which is kinda straightforward.
    */
+
+  // 1. Identify all the if ops and record the regions in each if op.
+  SmallDenseMap<Value, SmallVector<MemRefRegion, 4>, 4> ifRegions;
+
+  block.walk([&](AffineIfOp ifOp) {
+    SmallVector<MemRefRegion, 4> regionsInIf;
+
+    // Walk the 'then' and 'else' blocks of the ifOp
+    for (auto &block : ifOp.getBlocks()) {
+      block.walk([&](Operation *opInst) {
+        // Check for load or store operations and filter if necessary
+        if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+          if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+            return WalkResult::advance();
+          }
+        } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+          if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+            return WalkResult::advance();
+          }
+        } else {
+          // Neither load nor a store op.
+          return WalkResult::advance();
+        }
+
+        // Compute and store the memory region
+        auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
+        if (failed(region->compute(opInst, /* loopDepth= */ getNestingDepth(&*block.begin())))) {
+          return opInst->emitError("error obtaining memory region\n");
+        }
+        regionsInIf.push_back(std::move(region));
+        return WalkResult::advance();
+      });
+    }
+
+    ifRegions[ifOp.getCondition()] = std::move(regionsInIf);
+  });
+
+  // 2. Identify the mutually exclusive if ops.
+
+  // TODO: 
+
+
   for (const auto &region : regions) {
     Optional<int64_t> size = region.second->getRegionSize();
     if (!size.hasValue())
