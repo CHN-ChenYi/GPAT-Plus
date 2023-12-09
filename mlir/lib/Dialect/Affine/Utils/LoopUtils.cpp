@@ -2076,7 +2076,9 @@ LogicalResult mlir::generateCopy(
     AffineCopyOptions copyOptions, DenseMap<Value, Value> &fastBufferMap,
     DenseSet<Operation *> &copyNests, uint64_t *sizeInBytes,
     Block::iterator *nBegin, Block::iterator *nEnd,
-    ArrayRef<size_t> fastBufferPermutationIndex) {
+    ArrayRef<size_t> fastBufferPermutationIndex,
+    Optional<AffineValueMap> valueMapForAdvancedPermutationOrder) {
+  // TODO(permutation): Implement this.
   *nBegin = begin;
   *nEnd = end;
 

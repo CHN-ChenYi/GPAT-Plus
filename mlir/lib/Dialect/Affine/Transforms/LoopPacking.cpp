@@ -493,7 +493,8 @@ static LogicalResult generatePackings(
     Value memRef, Operation *forOp, std::unique_ptr<MemRefRegion> &readRegion,
     std::unique_ptr<MemRefRegion> &writeRegion,
     DenseSet<Operation *> &copyNests, AffineCopyOptions &copyOptions,
-    ArrayRef<size_t> permutationOrder) {
+    ArrayRef<size_t> permutationOrder,
+    Optional<AffineValueMap> valueMapForAdvancedPermutationOrder) {
   // Map from original memref's to the fast buffers that their accesses are
   // replaced with.
   DenseMap<Value, Value> fastBufferMap;
@@ -523,7 +524,8 @@ static LogicalResult generatePackings(
     LogicalResult iRet = generateCopy(
         *region, block, begin, end, copyPlacementBlock, copyInPlacementStart,
         copyOutPlacementStart, copyOptions, fastBufferMap, copyNests,
-        &sizeInBytes, &nBegin, &nEnd, permutationOrder);
+        &sizeInBytes, &nBegin, &nEnd, permutationOrder,
+        valueMapForAdvancedPermutationOrder);
     if (succeeded(iRet)) {
       // begin/end could have been invalidated, and need update.
       begin = nBegin;
@@ -641,6 +643,7 @@ public:
   /// Permutation vector, if not None, the packed buffer can be rearranged
   /// so its data layout correlates better with the current loop order
   Optional<SmallVector<size_t>> permutationOrder;
+  Optional<AffineValueMap> valueMapForAdvancedPermutationOrder;
   /// True if permutation changes the indexing of an innermost loop IV
   bool innermostLoopIVPermutation;
 
@@ -870,10 +873,16 @@ public:
                                                    packedShape.end()};
           SmallVector<int64_t> permutedtileShape{tileShape.begin(),
                                                  tileShape.end()};
-          permuteArrayBasedOnIndexes(permutedPackedShape,
-                                     this->permutationOrder.getValue());
-          permuteArrayBasedOnIndexes(permutedtileShape,
-                                     this->permutationOrder.getValue());
+          permuteArrayBasedOnIndexes(
+              permutedPackedShape,
+              this->permutationOrder
+                  .getValue()); // XXX: suppose advance permutation has the same
+                                // tlb reduction effect
+          permuteArrayBasedOnIndexes(
+              permutedtileShape,
+              this->permutationOrder
+                  .getValue()); // XXX: suppose advance permutation has the same
+                                // tlb reduction effect
           entriesPacking += approxCacheEntriesNeeded(
               memRefType, permutedPackedShape, permutedtileShape,
               1024 * TLBPageSizeInKiB);
@@ -902,10 +911,18 @@ public:
                                                      packedShape.end()};
             SmallVector<int64_t> permutedtileShape{tileShape.begin(),
                                                    tileShape.end()};
-            permuteArrayBasedOnIndexes(permutedPackedShape,
-                                       packing->permutationOrder.getValue());
-            permuteArrayBasedOnIndexes(permutedtileShape,
-                                       packing->permutationOrder.getValue());
+            permuteArrayBasedOnIndexes(
+                permutedPackedShape,
+                packing->permutationOrder
+                    .getValue()); // XXX: suppose advance permutation has the
+                                  // same
+                                  // tlb reduction effect
+            permuteArrayBasedOnIndexes(
+                permutedtileShape,
+                packing->permutationOrder
+                    .getValue()); // XXX: suppose advance permutation has the
+                                  // same
+                                  // tlb reduction effect
             entries = approxCacheEntriesNeeded(
                               memRefType, permutedPackedShape,
                               permutedtileShape, 1024 * TLBPageSizeInKiB);
@@ -1011,9 +1028,20 @@ public:
         // packing, do not permute
         if (this->permutationOrder != idx) {
           this->permutationOrder = None;
+          this->valueMapForAdvancedPermutationOrder = None;
           return WalkResult::interrupt();
         }
       }
+
+      // Update advanced packing exists
+      if (!this->valueMapForAdvancedPermutationOrder.hasValue()) {
+        this->valueMapForAdvancedPermutationOrder = map;
+      } else {
+        // XXX: AffineValueMap::operator!= does not work, so simply suppose the map
+        // must be different if there exist two loads/stores
+        this->valueMapForAdvancedPermutationOrder = None;
+      }
+
       return WalkResult::advance();
     });
 
@@ -1071,6 +1099,7 @@ public:
             if (isInnermostAffineForOp(ownerForOp) &&
                 this->permutationOrder.getValue()[resultIdx] != resultIdx) {
               this->innermostLoopIVPermutation = true;
+              this->valueMapForAdvancedPermutationOrder = map;
               return WalkResult::interrupt();
             }
           }
@@ -1082,6 +1111,7 @@ public:
 
     // check if innermost loop is at least two cache lines long
     // otherwise ignore innermost loop permutation
+    // XXX: suppose advance permutation has the same cache reduction effect
     if (this->innermostLoopIVPermutation) {
       auto packedShape = this->loop->getMemRefTileShape(this->memRef);
       if (packedShape.empty()) {
@@ -1131,7 +1161,7 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   }
 
   // Structure storing packing cadidates
-  SmallVector<PackingAttributes> packingCadidates;
+  SmallVector<PackingAttributes, 512> packingCadidates;
 
   // Add packing cadidates if loop is invariant to a memRef
   for (auto &loopInfo : loopInfoMap) {
@@ -1418,10 +1448,11 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
       if (packing->permutationOrder.hasValue())
         permutation = packing->permutationOrder.getValue();
 
-      if (failed(generatePackings(packing->memRef, packing->loop->forOp,
-                                  packing->getMemRefReadRegion(),
-                                  packing->getMemRefWriteRegion(), copyNests,
-                                  copyOptions, permutation))) {
+      if (failed(generatePackings(
+              packing->memRef, packing->loop->forOp,
+              packing->getMemRefReadRegion(), packing->getMemRefWriteRegion(),
+              copyNests, copyOptions, permutation,
+              packing->valueMapForAdvancedPermutationOrder))) {
         LLVM_DEBUG(dbgs() << "   [DEBUG] Failed to generate packing"
                           << "\n\n");
       } else {
@@ -1488,10 +1519,11 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
       if (packing->permutationOrder.hasValue())
         permutation = packing->permutationOrder.getValue();
 
-      if (failed(generatePackings(packing->memRef, packing->loop->forOp,
-                                  packing->getMemRefReadRegion(),
-                                  packing->getMemRefWriteRegion(), copyNests,
-                                  copyOptions, permutation))) {
+      if (failed(generatePackings(
+              packing->memRef, packing->loop->forOp,
+              packing->getMemRefReadRegion(), packing->getMemRefWriteRegion(),
+              copyNests, copyOptions, permutation,
+              packing->valueMapForAdvancedPermutationOrder))) {
         LLVM_DEBUG(dbgs() << "   [DEBUG] Failed to generate packing"
                           << "\n\n");
       } else {

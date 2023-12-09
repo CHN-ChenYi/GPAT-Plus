@@ -18,6 +18,7 @@
 #include "mlir/IR/Block.h"
 #include "mlir/Support/LLVM.h"
 #include "mlir/Support/LogicalResult.h"
+#include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 
 namespace mlir {
 class AffineForOp;
@@ -212,7 +213,8 @@ LogicalResult generateCopy(
     AffineCopyOptions copyOptions, DenseMap<Value, Value> &fastBufferMap,
     DenseSet<Operation *> &copyNests, uint64_t *sizeInBytes,
     Block::iterator *nBegin, Block::iterator *nEnd,
-    ArrayRef<size_t> fastBufferPermutationIndex = llvm::None);
+    ArrayRef<size_t> fastBufferPermutationIndex = llvm::None,
+    Optional<AffineValueMap> valueMapForAdvancedPermutationOrder = llvm::None);
 
 /// Result for calling generateCopyForMemRegion.
 struct CopyGenerateResult {
