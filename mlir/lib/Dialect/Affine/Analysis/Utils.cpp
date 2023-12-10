@@ -1329,64 +1329,6 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(Block &block,
     return None;
 
   int64_t totalSizeInBytes = 0;
-  /* TODO: YUXUAN JIAQI: We need to get all `AffineIfOp` in the block and record the records in the following way:
-    {
-      "if1_cond": [region1, region2],
-      "if2_cond": [region1, region3],
-      "if3_cond": [region1, region2, region3],
-      ...
-    }
-
-    After this, we need to indentify the if conditions that are mutually exclusive.
-    We consider the mutully exclusive ifs as a whole by taking the maximum memory footprint among all ifs.
-
-    So in all there are two significant tasks:
-    1. Identify the if ops, get the regions in each if op, and record them in the above way.
-    2. Identify the mutually exclusive if ops, this would require some kind of analysis on the if conditions. I bet there are some existing analysis in MLIR that we can use.
-
-    The rest of the task is to take the maximum memory footprint among all mutually exclusive if ops, which is kinda straightforward.
-   */
-
-  // 1. Identify all the if ops and record the regions in each if op.
-  SmallDenseMap<Value, SmallVector<MemRefRegion, 4>, 4> ifRegions;
-
-  block.walk([&](AffineIfOp ifOp) {
-    SmallVector<MemRefRegion, 4> regionsInIf;
-
-    // Walk the 'then' and 'else' blocks of the ifOp
-    for (auto &block : ifOp.getBlocks()) {
-      block.walk([&](Operation *opInst) {
-        // Check for load or store operations and filter if necessary
-        if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
-          if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
-            return WalkResult::advance();
-          }
-        } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
-          if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
-            return WalkResult::advance();
-          }
-        } else {
-          // Neither load nor a store op.
-          return WalkResult::advance();
-        }
-
-        // Compute and store the memory region
-        auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
-        if (failed(region->compute(opInst, /* loopDepth= */ getNestingDepth(&*block.begin())))) {
-          return opInst->emitError("error obtaining memory region\n");
-        }
-        regionsInIf.push_back(std::move(region));
-        return WalkResult::advance();
-      });
-    }
-
-    ifRegions[ifOp.getCondition()] = std::move(regionsInIf);
-  });
-
-  // 2. Identify the mutually exclusive if ops.
-
-  // TODO: 
-
 
   for (const auto &region : regions) {
     Optional<int64_t> size = region.second->getRegionSize();
@@ -1404,6 +1346,147 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(AffineForOp forOp,
   return ::getMemoryFootprintBytes(
       *forInst->getBlock(), Block::iterator(forInst),
       std::next(Block::iterator(forInst)), memorySpace, filterMemRef);
+}
+
+bool mlir::isAffineIfOpTopLevelInLoop(AffineIfOp ifOp, AffineForOp forOp) {
+  // Check if the operation is inside an AffineIfOp that is also inside the
+  // outermost loop
+  Operation *parent = ifOp.getOperation()->getParentOp();
+  while (parent != nullptr && parent != forOp.getOperation()) {
+    if (isa<AffineIfOp>(parent)) {
+      return false;
+    }
+    parent = parent->getParentOp();
+  }
+  return true;
+}
+
+void mlir::getTopLevelAffineIfOpsinAffineForOp(AffineForOp parentForOp, SmallVectorImpl<AffineIfOp> &ifOps) {
+    // Lambda function to walk through a region and collect top-level AffineIfOps
+    parentForOp.walk([&](AffineIfOp ifOp) {
+        if (isAffineIfOpTopLevelInLoop(ifOp, parentForOp)) {
+            ifOps.push_back(ifOp);
+        }
+    });
+}
+
+bool mlir::isAffineIfOpTopLevelInAffineIfOp(AffineIfOp ifOp, AffineIfOp parentIfOp) {
+  Operation *parent = ifOp.getOperation()->getParentOp();
+  while (parent != nullptr && parent != parentIfOp.getOperation()) {
+    if (isa<AffineIfOp>(parent)) {
+      return false;
+    }
+    parent = parent->getParentOp();
+  }
+  return true;
+}
+
+void mlir::getTopLevelAffineIfOpsinAffineIfOp(AffineIfOp parentIfOp, SmallVectorImpl<AffineIfOp> &ifOps) {
+    // Lambda function to walk through a region and collect top-level AffineIfOps
+    auto collectTopLevelIfOps = [&](Region &region) {
+        region.walk([&](AffineIfOp ifOp) {
+            if (isAffineIfOpTopLevelInAffineIfOp(ifOp, parentIfOp)) {
+                ifOps.push_back(ifOp);
+            }
+        });
+    };
+
+    // Collect top-level AffineIfOps from the 'then' region
+    collectTopLevelIfOps(parentIfOp.getThenRegion());
+
+    // Collect top-level AffineIfOps from the 'else' region, if it exists
+    if (parentIfOp.hasElseRegion()) {
+        collectTopLevelIfOps(parentIfOp.getElseRegion());
+    }
+}
+
+
+Optional<int64_t> mlir::getMemoryFootprintBytesWithBranches(
+                                                AffineForOp forOp,
+                                                Block &block,
+                                                Block::iterator start,
+                                                Block::iterator end,
+                                                int memorySpace,
+                                                Optional<Value> filterMemRef) {
+  SmallDenseMap<Value, SmallVector<std::unique_ptr<MemRefRegion>, 4>, 4> regions;
+
+  // Walk this `affine.for` operation
+  auto result = block.walk(start, end, [&](Opetation *opInst) -> WalkResult {
+    // Filter by memrefs if FilterMemRef was specified // TODO: handle this for if
+    if (auto loadOp = dyn_cast<AffineReadOpInterface(opInst)) {
+      if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else if (auto storeOp = dyn_cast<AffineStoreOpInterface(opInst)) {
+      if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else {
+      // Neither load nor a store op.
+      return WalkResult::advance();
+    }
+
+    if (OpInst->getParentOpOfType<AffineIfOp>() != nullptr && 
+        forOp.isProperAncestor(OpInst->getParentOfType<AffineIfOp>())) {
+      // Skip operations that are inside an AffineIfOp within the loop
+      return WalkResult::advance();
+    }
+
+    // Compute the memref region symbolic in any IVs enclosing this block.
+    auto region = std::make_unique<MemRefRegion>(OpInst->getLoc());
+    if (failed (
+            region->compute(opInst,
+                            /*loopDepth=*/getNestingDepth(&*block.begin())))) {
+      return opInst->emitError("error obtaining memory region\n");
+    }
+
+    regions[region->memref] = std::move(region);
+    return WalkResult::advance();
+  });
+
+  if (result.wasInterrupted())
+    return None;
+
+  // now, walk all the ifOps inside the block
+  // TODO: initialize data structures
+  auto ifOps = block.getOps<AffineIfOp>();
+  SmallVector<AffineIfOp, 4> visitedIfOps;
+
+  SmallDenseMap<Value, SmallVector<std::unique_ptr<MemRefRegion>, 4>, 4> ifRegions;
+  for (auto ifOp : ifOps) {
+    // TODO: every if processed in this loop should not be nested inside another if
+    if (visitedIfOps.count(ifOp) > 0) {
+      // skip if we have already processed this if
+      continue;
+    }
+    if (!isAffineIfOpTopLevelInLoop(ifOp, forOp)) {
+      // skip if this if is not top level in the loop
+      continue;
+    }
+
+    // start processing this if, first check if it has a else region
+    if (ifOp.hasElseRegion()) {
+      LLVM_DEBUG(llvm::dbgs() << "Processing if with else: " << *ifOp << "\n");
+      // TODO: handle if with else
+    } else {
+      LLVM_DEBUG(llvm::dbgs() << "Processing if without else: " << *ifOp << "\n");
+    }
+    visitedIfOps.push_back(ifOp);
+
+    // TODO: handle its children
+
+
+    // push forward the ifOp's children
+  }
+
+}
+
+Optional<int64_t> mlir::getMemoryFootprintBytesWithBranches(
+    AffineForOp forOp, int memorySpace, Optional<Value> filterMemRef) {
+  auto *forInst = forOp.getOperation();
+  return ::getMemoryFootprintBytesWithBranches(forOp, *forInst->getBlock(), Block::iterator(),
+                                   std::next(Block::iterator(forInst)),
+                                   memorySpace, filterMemRef);
 }
 
 /// Returns whether a loop is parallel and contains a reduction loop.
