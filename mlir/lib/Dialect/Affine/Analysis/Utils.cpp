@@ -1365,7 +1365,7 @@ void mlir::getTopLevelAffineIfOpsinAffineForOp(AffineForOp parentForOp, SmallVec
     // Lambda function to walk through a region and collect top-level AffineIfOps
     parentForOp.walk([&](AffineIfOp ifOp) {
         if (isAffineIfOpTopLevelInLoop(ifOp, parentForOp)) {
-            ifOps.push_back(ifOp);
+            ifOps.push_back(std::move(ifOp));
         }
     });
 }
@@ -1381,25 +1381,136 @@ bool mlir::isAffineIfOpTopLevelInAffineIfOp(AffineIfOp ifOp, AffineIfOp parentIf
   return true;
 }
 
-void mlir::getTopLevelAffineIfOpsinAffineIfOp(AffineIfOp parentIfOp, SmallVectorImpl<AffineIfOp> &ifOps) {
-    // Lambda function to walk through a region and collect top-level AffineIfOps
-    auto collectTopLevelIfOps = [&](Region &region) {
-        region.walk([&](AffineIfOp ifOp) {
-            if (isAffineIfOpTopLevelInAffineIfOp(ifOp, parentIfOp)) {
-                ifOps.push_back(ifOp);
-            }
-        });
-    };
-
+void mlir::getTopLevelAffineIfOpsinAffineIfOp(AffineIfOp parentIfOp, SmallVectorImpl<AffineIfOp> &thenIfOps, SmallVectorImpl<AffineIfOp> &elseIfOps) {
     // Collect top-level AffineIfOps from the 'then' region
-    collectTopLevelIfOps(parentIfOp.getThenRegion());
+    parentIfOp.getThenRegion().walk([&](AffineIfOp ifOp) {
+        if (isAffineIfOpTopLevelInAffineIfOp(ifOp, parentIfOp)) {
+            thenIfOps.push_back(std::move(ifOp));
+        }
+    });
 
     // Collect top-level AffineIfOps from the 'else' region, if it exists
     if (parentIfOp.hasElseRegion()) {
-        collectTopLevelIfOps(parentIfOp.getElseRegion());
+      parentIfOp.getElseRegion().walk([&](AffineIfOp ifOp) {
+          if (isAffineIfOpTopLevelInAffineIfOp(ifOp, parentIfOp)) {
+              elseIfOps.push_back(std::move(ifOp));
+          }
+      });
     }
 }
 
+Optional<int64_t> mlir::calculateAffineIfOpMemoryFootprintBytes(AffineIfOp ifOp, AffineForOp parentForOp, SmallVector<MemRefRegion, 4> &originalRefs Optional<Value> filterMemRef) {
+  /*
+    aegs: 
+      ifOp: the AffineIfOp to calculate the memory footprint
+      parentForOp: the AffineForOp that contains the AffineIfOp, this is needed to calculate the loop depth and the region memory footprint
+      originalRefs: the vector of MemRefRegion that stores the original regions before merging
+      filterMemRef: the memref to filter
+
+    return:
+      the memory footprint of the AffineIfOp, this is intended to be used only when deciding which children to take
+  */
+  
+  // childIfOps is a vector of AffineIfOps that are top-level in the current AffineIfOp
+  SmallVector<AffineIfOp, 4> childThenIfOps;
+  SmallVector<AffineIfOp, 4> childElseIfOps;
+  getTopLevelAffineIfOpsinAffineIfOp(ifOp, childThenIfOps, childElseIfOps);
+
+  auto calculateAbsoluteMemoryFootprintBytes = [&](Region &parentRegion, SmallVector<MemRefRegion, 4> &consideredParentRegions, Optional<Value> filterMemRef) {
+    SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> regions;
+
+    // Walk this 'affine.for' operation to gather all memory regions.
+    auto result = parentRegion.walk([&](Operation *opInst) -> WalkResult {
+      // Filter by memrefs if FilterMemRef was specified
+      if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+        if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+          return WalkResult::advance();
+        }
+      } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+        if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+          return WalkResult::advance();
+        }
+      } else if (isa<AffineIfOp>(opInst)) {
+        // fail if we encounter an AffineIfOp, as this should never happen
+        return opInst->emitError("calculateAbsoluteMemoryFootprintBytes: encountered an AffineIfOp");
+      } else {
+        // Neither load nor a store op.
+        return WalkResult::advance();
+      }
+
+      // Compute the memref region symbolic in any IVs enclosing this block.
+      auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
+      if (failed(
+              region->compute(opInst,
+                              /*loopDepth=*/getNestingDepth(&*block.begin())))) {
+        return opInst->emitError("error obtaining memory region\n");
+      }
+
+      // first make a copy of the region object and store it in the originalRefs vector
+      originalRefs.push_back(region);
+
+      auto it = regions.find(region->memref);
+      if (it == regions.end()) {
+        regions[region->memref] = std::move(region);
+      } else if (failed(it->second->unionBoundingBox(*region))) {
+        return opInst->emitWarning(
+            "getMemoryFootprintBytes: unable to perform a union on a memory "
+            "region");
+      }
+      return WalkResult::advance();
+    });
+
+    if (result.wasInterrupted())
+      return None;
+
+    int64_t totalSizeInBytes = 0;
+
+    for (const auto &region : regions) {
+      Optional<int64_t> size = region.second->getRegionSize();
+      if (!size.hasValue())
+        return None;
+      totalSizeInBytes += size.getValue();
+    }
+
+    return totalSizeInBytes;
+  };
+
+  // base case: there is no child AffineIfOp, calculate the max between then and else regions footprint
+  if (childThenIfOps.empty() && childElseIfOps.empty()) {
+    // 1. calculate the footprint of the then region
+    SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> thenOriginalRegions;
+    int64_t thenFootprint = calculateAbsoluteMemoryFootprintBytes(ifOp.getThenRegion(), thenOriginalRegions, filterMemRef);
+    int64_t elseFootprint = 0;
+    if (ifOp.hasElseRegion()) {
+      // 2. calculate the footprint of the else region, if it exists
+      SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> elseOriginalRegions;
+      elseFootprint = calculateAbsoluteMemoryFootprintBytes(ifOp.getElseRegion(), elseOriginalRegions, filterMemRef);
+    }
+
+    if (thenFootprint > elseFootprint) {
+      // 3. return the footprint of the then region
+      for (auto region : thenOriginalRegions) {
+        originalRefs.push_back(region);
+      }
+      return thenFootprint;
+    } else {
+      // 3. return the footprint of the else region
+      for (auto region : elseOriginalRegions) {
+        originalRefs.push_back(region);
+      }
+      return elseFootprint;
+    }
+  }
+
+  if (childThenIfOps.size() >= 1 || childElseIfOps.size() >= 1) {
+    // for each childIfOp, calculate the footprint by recursively calling this function
+    // TODO: we need datastructures to store the footprint of each childIfOp, the footprint should be a vector of regions and everytime the absolute footprint is calculated, we merge the regions with the footprint of the parentIfOp
+
+    for (auto childIfOp : childIfOps) {
+      calculateAffineIfOpMemoryFootprintBytes(childIfOp, filterMemRef);
+    }
+  }
+}
 
 Optional<int64_t> mlir::getMemoryFootprintBytesWithBranches(
                                                 AffineForOp forOp,
@@ -1449,34 +1560,15 @@ Optional<int64_t> mlir::getMemoryFootprintBytesWithBranches(
 
   // now, walk all the ifOps inside the block
   // TODO: initialize data structures
-  auto ifOps = block.getOps<AffineIfOp>();
-  SmallVector<AffineIfOp, 4> visitedIfOps;
+  SmallVector<AffineIfOp, 4> ifOps;
+  auto topLevelAffineIfOps = getTopLevelAffineIfOpsinAffineForOp(forOp, ifOps);
+  for (auto ifOp : topLevelAffineIfOps) {
+    LLVM_DEBUG(llvm::dbgs() << "ifOp: " << *ifOp << "\n");
 
-  SmallDenseMap<Value, SmallVector<std::unique_ptr<MemRefRegion>, 4>, 4> ifRegions;
-  for (auto ifOp : ifOps) {
-    // TODO: every if processed in this loop should not be nested inside another if
-    if (visitedIfOps.count(ifOp) > 0) {
-      // skip if we have already processed this if
-      continue;
-    }
-    if (!isAffineIfOpTopLevelInLoop(ifOp, forOp)) {
-      // skip if this if is not top level in the loop
-      continue;
-    }
+    // start processing: for each ifOp, calculate the naive memory footprint 
+    // (we do not merge regions inside the ifOp with other regions outside the ifOp yet)
+    
 
-    // start processing this if, first check if it has a else region
-    if (ifOp.hasElseRegion()) {
-      LLVM_DEBUG(llvm::dbgs() << "Processing if with else: " << *ifOp << "\n");
-      // TODO: handle if with else
-    } else {
-      LLVM_DEBUG(llvm::dbgs() << "Processing if without else: " << *ifOp << "\n");
-    }
-    visitedIfOps.push_back(ifOp);
-
-    // TODO: handle its children
-
-
-    // push forward the ifOp's children
   }
 
 }
