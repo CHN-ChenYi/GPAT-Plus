@@ -1977,8 +1977,8 @@ static AffineForOp generateAdvancePointWiseCopy(
   auto zeroInt = b.create<arith::ConstantIntOp>(loc, 0, 32);
   auto oneInt = b.create<arith::ConstantIntOp>(loc, 1, 32);
   auto counterRef = b.create<memref::AllocOp>(loc, counterType).getResult();
-  b.create<AffineStoreOp>(loc, zeroInt, counterRef, ValueRange{zeroIndex});
   b.setInsertionPointAfterValue(counterRef);
+  b.create<AffineStoreOp>(counterRef.getLoc(), zeroInt, counterRef, ValueRange{zeroIndex});
 
   // get outermost loop
   std::vector<AffineForOp> loops;
