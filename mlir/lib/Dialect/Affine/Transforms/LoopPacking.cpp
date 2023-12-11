@@ -568,7 +568,7 @@ public:
   Optional<int64_t> getMemRefFootprint(Value memRef) {
     if (this->memRefFootprintMap.count(memRef) == 0)
       memRefFootprintMap[memRef] =
-          getMemoryFootprintBytes(this->forOp, /*memorySpace*/ 0, memRef);
+          getMemoryFootprintBytesWithBranches(this->forOp, /*memorySpace*/ 0, memRef);
 
     return this->memRefFootprintMap[memRef];
   }
@@ -731,7 +731,7 @@ public:
       if (this->memRef == memRef)
         continue;
 
-      auto footprint = getMemoryFootprintBytes(
+      auto footprint = getMemoryFootprintBytesWithBranches(
           *forBodyBlock, forBodyBlock->begin(), forBodyBlock->end(), 0, memRef);
       if (footprint.hasValue())
         otherMemrefFootprint += 2 * footprint.getValue();
@@ -1209,7 +1209,7 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
 
   // No need for packing if everything already fits in l1 cache
   Optional<int64_t> totalFootprint =
-      getMemoryFootprintBytes(outerForOp, /*memorySpace=*/0);
+      getMemoryFootprintBytesWithBranches(outerForOp, /*memorySpace=*/0);
   if (!this->ignoreCache && totalFootprint.hasValue() &&
       static_cast<uint64_t>(totalFootprint.getValue()) <
           this->l1CacheSizeInKiB * 1024) {
