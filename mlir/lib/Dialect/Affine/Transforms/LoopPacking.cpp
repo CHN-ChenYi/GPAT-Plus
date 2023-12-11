@@ -526,7 +526,10 @@ static LogicalResult generatePackings(
         *region, block, begin, end, copyPlacementBlock, copyInPlacementStart,
         copyOutPlacementStart, copyOptions, fastBufferMap, copyNests,
         &sizeInBytes, &nBegin, &nEnd, permutationOrder,
-        valueMapForAdvancedPermutationOrder.hasValue() ? valueMapForAdvancedPermutationOrder.getPointer() : nullptr, &forOp);
+        valueMapForAdvancedPermutationOrder.hasValue()
+            ? valueMapForAdvancedPermutationOrder.getPointer()
+            : nullptr,
+        &forOp);
     if (succeeded(iRet)) {
       // begin/end could have been invalidated, and need update.
       begin = nBegin;

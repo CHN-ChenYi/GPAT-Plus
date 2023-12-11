@@ -1962,11 +1962,9 @@ bool mlir::isInnermostAffineForOp(AffineForOp op) {
               .wasInterrupted();
 }
 
-static AffineForOp generateAdvancePointWiseCopy(Location loc, Value memRef,
-                                                Value fastMemRef, AffineExpr zeroOffset,
-                                                bool isCopyOut, OpBuilder b,
-                                                AffineValueMap *access, AffineForOp *forOp,
-                                                unsigned fastMemorySpace) {
+static AffineForOp generateAdvancePointWiseCopy(
+    Location loc, Value memRef, Value fastMemRef, bool isCopyOut, OpBuilder b,
+    AffineValueMap *access, AffineForOp *forOp, unsigned fastMemorySpace) {
   llvm::dbgs() << "generateAdvancePointWiseCopy\n";
   llvm::dbgs() << "  isCopyOut: " << isCopyOut << "\n";
 
@@ -2023,21 +2021,23 @@ static AffineForOp generateAdvancePointWiseCopy(Location loc, Value memRef,
   MemRefAccess *newAccess;
   AffineValueMap newMap;
   newForOp.walk([&](Operation *op) {
-      // get stores and loads related affected by this packing
-      if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
-        if (memRef != loadOp.getMemRef() || isCopyOut) // TODO: suppose there's only one read
-          return WalkResult::advance();
-      } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) { // TODO: suppose there's only own write
-        if (memRef != storeOp.getMemRef() || !isCopyOut)
-          return WalkResult::advance();
-      } else {
+    // get stores and loads related affected by this packing
+    if (auto loadOp = dyn_cast<AffineLoadOp>(op)) {
+      if (memRef != loadOp.getMemRef() ||
+          isCopyOut) // TODO(permutation): suppose there's only one read
         return WalkResult::advance();
-      }
-      newAccessOp = op;
-      newAccess = new MemRefAccess(op);
-      newAccess->getAccessMap(&newMap);
-      b.setInsertionPointAfter(op);
-      return WalkResult::interrupt();
+    } else if (auto storeOp = dyn_cast<AffineStoreOp>(
+                   op)) { // TODO(permutation): suppose there's only own write
+      if (memRef != storeOp.getMemRef() || !isCopyOut)
+        return WalkResult::advance();
+    } else {
+      return WalkResult::advance();
+    }
+    newAccessOp = op;
+    newAccess = new MemRefAccess(op);
+    newAccess->getAccessMap(&newMap);
+    b.setInsertionPointAfter(op);
+    return WalkResult::interrupt();
   });
   loops.clear();
   for (unsigned int resultIdx = 0; resultIdx < newMap.getNumResults();
@@ -2059,7 +2059,7 @@ static AffineForOp generateAdvancePointWiseCopy(Location loc, Value memRef,
 
   // delete all operations except loop headers, terminator and memref
   // loops has no reverse iterator
-  std::deque<Operation*> reverse_body;
+  std::deque<Operation *> reverse_body;
   for (auto &op : loops.back())
     reverse_body.push_front(&op);
 
@@ -2067,21 +2067,29 @@ static AffineForOp generateAdvancePointWiseCopy(Location loc, Value memRef,
   if (!isCopyOut) {
     // Copy in.
     b.setInsertionPointAfter(newAccessOp);
-    auto counter = b.create<AffineLoadOp>(newAccessOp->getLoc(), counterRef, ValueRange{zeroIndex});
-    auto counterIndex = b.create<arith::IndexCastOp>(counter->getLoc(), b.getIndexType(), counter);
-    auto store = b.create<memref::StoreOp>(counterIndex->getLoc(), newAccessOp->getResult(0), fastMemRef, ValueRange{counterIndex});
+    auto counter = b.create<AffineLoadOp>(newAccessOp->getLoc(), counterRef,
+                                          ValueRange{zeroIndex});
+    auto counterIndex = b.create<arith::IndexCastOp>(counter->getLoc(),
+                                                     b.getIndexType(), counter);
+    auto store = b.create<memref::StoreOp>(
+        counterIndex->getLoc(), newAccessOp->getResult(0), fastMemRef,
+        ValueRange{counterIndex});
     auto add = b.create<arith::AddIOp>(store->getLoc(), counter, oneInt);
-    b.create<AffineStoreOp>(add->getLoc(), add, counterRef, ValueRange{zeroIndex});
+    b.create<AffineStoreOp>(add->getLoc(), add, counterRef,
+                            ValueRange{zeroIndex});
   } else {
     // Copy out.
-    // TODO(permutation)
     b.setInsertionPointToStart(&loops.back().getLoopBody().getBlocks().front());
-    auto counter = b.create<AffineLoadOp>(loops.back().getLoopBody().getLoc(), counterRef, ValueRange{zeroIndex});
-    auto counterIndex = b.create<arith::IndexCastOp>(counter->getLoc(), b.getIndexType(), counter);
-    auto load = b.create<memref::LoadOp>(counterIndex->getLoc(), fastMemRef, ValueRange{counterIndex});
+    auto counter = b.create<AffineLoadOp>(loops.back().getLoopBody().getLoc(),
+                                          counterRef, ValueRange{zeroIndex});
+    auto counterIndex = b.create<arith::IndexCastOp>(counter->getLoc(),
+                                                     b.getIndexType(), counter);
+    auto load = b.create<memref::LoadOp>(counterIndex->getLoc(), fastMemRef,
+                                         ValueRange{counterIndex});
     newAccessOp->setOperand(0, load);
     auto add = b.create<arith::AddIOp>(newAccessOp->getLoc(), counter, oneInt);
-    b.create<AffineStoreOp>(add->getLoc(), add, counterRef, ValueRange{zeroIndex});
+    b.create<AffineStoreOp>(add->getLoc(), add, counterRef,
+                            ValueRange{zeroIndex});
   }
 
   for (auto &op_ptr : reverse_body) {
@@ -2094,8 +2102,6 @@ static AffineForOp generateAdvancePointWiseCopy(Location loc, Value memRef,
 
   b.setInsertionPointAfter(newForOp);
   b.create<memref::DeallocOp>(newForOp->getLoc(), counterRef);
-
-  llvm::dbgs() << newForOp << "\n";
 
   delete newAccess;
 
@@ -2163,8 +2169,6 @@ generatePointWiseCopy(Location loc, Value memref, Value fastMemRef,
     memIndices.push_back(forOp.getInductionVar());
   }
 
-  llvm::dbgs() << "correct: " << copyNestRoot << "\n";
-
   // permute fastBufExprs
   if (!fastBufferPermutationIndex.empty()) {
     permuteArrayBasedOnIndexes(fastBufExprs, fastBufferPermutationIndex);
@@ -2201,10 +2205,11 @@ emitRemarkForBlock(Block &block) {
   return block.getParentOp()->emitRemark();
 }
 
-static LogicalResult advanceReplaceAllMemRefUsesWith(
-    Value oldMemRef, Value newMemRef, Operation *domOpFilter,
-    Operation *postDomOpFilter, AffineForOp *forOp,
-    unsigned int fastMemorySpace, bool isCopyOut) {
+static LogicalResult
+advanceReplaceAllMemRefUsesWith(Value oldMemRef, Value newMemRef,
+                                Operation *domOpFilter,
+                                Operation *postDomOpFilter, AffineForOp *forOp,
+                                unsigned int fastMemorySpace, bool isCopyOut) {
   std::unique_ptr<DominanceInfo> domInfo;
   std::unique_ptr<PostDominanceInfo> postDomInfo;
   if (domOpFilter)
@@ -2236,8 +2241,8 @@ static LogicalResult advanceReplaceAllMemRefUsesWith(
     // not allowNonDereferencingOps
     if (!isa<AffineMapAccessInterface>(*op)) {
       LLVM_DEBUG(llvm::dbgs()
-                  << "Memref replacement failed: non-deferencing memref op: \n"
-                  << *op << '\n');
+                 << "Memref replacement failed: non-deferencing memref op: \n"
+                 << *op << '\n');
       return failure();
     }
 
@@ -2253,25 +2258,27 @@ static LogicalResult advanceReplaceAllMemRefUsesWith(
 
     if (usePositions.size() > 1) {
       // TODO: extend it for this case when needed (rare).
-      assert(false && "multiple dereferencing uses in a single op not supported");
+      assert(false &&
+             "multiple dereferencing uses in a single op not supported");
       return failure();
     }
 
+    // get outermost loop that introduces induction variable is used in op
     unsigned int outermostForOpDepth = -1;
     AffineForOp outermostForOp;
     AffineValueMap newMap;
     MemRefAccess(op).getAccessMap(&newMap);
     for (unsigned int resultIdx = 0; resultIdx < newMap.getNumResults();
-        resultIdx++) {
+         resultIdx++) {
       for (size_t operandIdx = 0; operandIdx < newMap.getNumOperands();
-          operandIdx++) {
+           operandIdx++) {
         auto operand = newMap.getOperand(operandIdx);
         if (isForInductionVar(operand) &&
             newMap.isFunctionOf(resultIdx, operand)) {
           auto ownerForOp = getForInductionVarOwner(operand);
           auto ownerForOpDepth = getNestingDepth(ownerForOp);
-          if (getNestingDepth(*forOp) <= ownerForOpDepth
-              && ownerForOpDepth < outermostForOpDepth) {
+          if (getNestingDepth(*forOp) <= ownerForOpDepth &&
+              ownerForOpDepth < outermostForOpDepth) {
             outermostForOpDepth = ownerForOpDepth;
             outermostForOp = ownerForOp;
           }
@@ -2283,31 +2290,43 @@ static LogicalResult advanceReplaceAllMemRefUsesWith(
     OpBuilder initBuilder(outermostForOp);
     Location loc = outermostForOp.getLoopBody().getLoc();
     ArrayRef<int64_t> one_index = {1};
-    auto counterType =
-        MemRefType::get(one_index, IntegerType::get(initBuilder.getContext(), 32),
-                        initBuilder.getDimIdentityMap(), fastMemorySpace);
+    auto counterType = MemRefType::get(
+        one_index, IntegerType::get(initBuilder.getContext(), 32),
+        initBuilder.getDimIdentityMap(), fastMemorySpace);
     auto zeroIndex = initBuilder.create<arith::ConstantIndexOp>(loc, 0);
     auto oneInt = initBuilder.create<arith::ConstantIntOp>(loc, 1, 32);
     auto zeroInt = initBuilder.create<arith::ConstantIntOp>(loc, 0, 32);
-    auto counterRef = initBuilder.create<memref::AllocOp>(loc, counterType).getResult();
-    initBuilder.create<AffineStoreOp>(loc, zeroInt, counterRef, ValueRange{zeroIndex});
+    auto counterRef =
+        initBuilder.create<memref::AllocOp>(loc, counterType).getResult();
+    initBuilder.create<AffineStoreOp>(loc, zeroInt, counterRef,
+                                      ValueRange{zeroIndex});
     initBuilder.setInsertionPointAfter(outermostForOp);
     initBuilder.create<memref::DeallocOp>(outermostForOp->getLoc(), counterRef);
 
+    // replace
     OpBuilder b(op);
     Operation *newAccess;
     if (isa<AffineLoadOp>(op)) {
-      auto counter = b.create<AffineLoadOp>(op->getLoc(), counterRef, ValueRange{zeroIndex});
-      auto counterIndex = b.create<arith::IndexCastOp>(counter->getLoc(), b.getIndexType(), counter);
-      newAccess = b.create<memref::LoadOp>(counterIndex->getLoc(), newMemRef, ValueRange{counterIndex});
+      auto counter = b.create<AffineLoadOp>(op->getLoc(), counterRef,
+                                            ValueRange{zeroIndex});
+      auto counterIndex = b.create<arith::IndexCastOp>(
+          counter->getLoc(), b.getIndexType(), counter);
+      newAccess = b.create<memref::LoadOp>(counterIndex->getLoc(), newMemRef,
+                                           ValueRange{counterIndex});
       auto add = b.create<arith::AddIOp>(newAccess->getLoc(), counter, oneInt);
-      b.create<AffineStoreOp>(add->getLoc(), add, counterRef, ValueRange{zeroIndex});
+      b.create<AffineStoreOp>(add->getLoc(), add, counterRef,
+                              ValueRange{zeroIndex});
     } else if (isa<AffineStoreOp>(op)) {
-      auto counter = b.create<AffineLoadOp>(op->getLoc(), counterRef, ValueRange{zeroIndex});
-      auto counterIndex = b.create<arith::IndexCastOp>(counter->getLoc(), b.getIndexType(), counter);
-      newAccess = b.create<memref::StoreOp>(counterIndex->getLoc(), op->getOperand(0), newMemRef, ValueRange{counterIndex});
+      auto counter = b.create<AffineLoadOp>(op->getLoc(), counterRef,
+                                            ValueRange{zeroIndex});
+      auto counterIndex = b.create<arith::IndexCastOp>(
+          counter->getLoc(), b.getIndexType(), counter);
+      newAccess =
+          b.create<memref::StoreOp>(counterIndex->getLoc(), op->getOperand(0),
+                                    newMemRef, ValueRange{counterIndex});
       auto add = b.create<arith::AddIOp>(newAccess->getLoc(), counter, oneInt);
-      b.create<AffineStoreOp>(add->getLoc(), add, counterRef, ValueRange{zeroIndex});
+      b.create<AffineStoreOp>(add->getLoc(), add, counterRef,
+                              ValueRange{zeroIndex});
     } else {
       llvm::dbgs() << "advanceReplaceAllMemRefUsesWith failed, op: \n"
                    << *op << '\n';
@@ -2342,11 +2361,8 @@ LogicalResult mlir::generateCopy(
     DenseSet<Operation *> &copyNests, uint64_t *sizeInBytes,
     Block::iterator *nBegin, Block::iterator *nEnd,
     ArrayRef<size_t> fastBufferPermutationIndex,
-    AffineValueMap *valueMapForAdvancedPermutationOrder,
-    AffineForOp *forOp) {
+    AffineValueMap *valueMapForAdvancedPermutationOrder, AffineForOp *forOp) {
   bool hasAdvancedPermutationOrder = valueMapForAdvancedPermutationOrder;
-  llvm::dbgs() << "generateCopy entry" << "\n";
-  // TODO(permutation): Implement this.
   *nBegin = begin;
   *nEnd = end;
 
@@ -2387,7 +2403,6 @@ LogicalResult mlir::generateCopy(
   SmallVector<Value, 4> bufIndices;
 
   unsigned rank = memRefType.getRank();
-  llvm::dbgs() << "Rank: " << rank << "\n";
   SmallVector<int64_t, 4> fastBufferShape, advanceBufferShape;
 
   // Compute the extents of the buffer.
@@ -2430,43 +2445,41 @@ LogicalResult mlir::generateCopy(
 
   // Index start offsets for faster memory buffer relative to the original.
   SmallVector<AffineExpr, 4> fastBufOffsets;
-  // if (!hasAdvancedPermutationOrder) {
-    fastBufOffsets.reserve(rank);
-    for (unsigned d = 0; d < rank; d++) {
-      assert(lbs[d].size() == cst->getNumCols() - rank && "incorrect bound size");
+  fastBufOffsets.reserve(rank);
+  for (unsigned d = 0; d < rank; d++) {
+    assert(lbs[d].size() == cst->getNumCols() - rank && "incorrect bound size");
 
-      AffineExpr offset = top.getAffineConstantExpr(0);
-      for (unsigned j = 0, e = cst->getNumCols() - rank - 1; j < e; j++)
-        offset = offset + lbs[d][j] * top.getAffineDimExpr(j);
-      assert(lbDivisors[d] > 0);
-      offset =
-          (offset + lbs[d][cst->getNumCols() - 1 - rank]).floorDiv(lbDivisors[d]);
+    AffineExpr offset = top.getAffineConstantExpr(0);
+    for (unsigned j = 0, e = cst->getNumCols() - rank - 1; j < e; j++)
+      offset = offset + lbs[d][j] * top.getAffineDimExpr(j);
+    assert(lbDivisors[d] > 0);
+    offset =
+        (offset + lbs[d][cst->getNumCols() - 1 - rank]).floorDiv(lbDivisors[d]);
 
-      // Set copy start location for this dimension in the lower memory space
-      // memref.
-      if (auto caf = offset.dyn_cast<AffineConstantExpr>()) {
-        auto indexVal = caf.getValue();
-        if (indexVal == 0) {
-          memIndices.push_back(zeroIndex);
-        } else {
-          memIndices.push_back(
-              top.create<arith::ConstantIndexOp>(loc, indexVal).getResult());
-        }
+    // Set copy start location for this dimension in the lower memory space
+    // memref.
+    if (auto caf = offset.dyn_cast<AffineConstantExpr>()) {
+      auto indexVal = caf.getValue();
+      if (indexVal == 0) {
+        memIndices.push_back(zeroIndex);
       } else {
-        // The coordinate for the start location is just the lower bound along the
-        // corresponding dimension on the memory region (stored in 'offset').
-        auto map = AffineMap::get(
-            cst->getNumDimIds() + cst->getNumSymbolIds() - rank, 0, offset);
-        memIndices.push_back(b.create<AffineApplyOp>(loc, map, regionSymbols));
+        memIndices.push_back(
+            top.create<arith::ConstantIndexOp>(loc, indexVal).getResult());
       }
-      // The fast buffer is copied into at location zero; addressing is relative.
-      bufIndices.push_back(zeroIndex);
-
-      // Record the offsets since they are needed to remap the memory accesses of
-      // the original memref further below.
-      fastBufOffsets.push_back(offset);
+    } else {
+      // The coordinate for the start location is just the lower bound along the
+      // corresponding dimension on the memory region (stored in 'offset').
+      auto map = AffineMap::get(
+          cst->getNumDimIds() + cst->getNumSymbolIds() - rank, 0, offset);
+      memIndices.push_back(b.create<AffineApplyOp>(loc, map, regionSymbols));
     }
-  // }
+    // The fast buffer is copied into at location zero; addressing is relative.
+    bufIndices.push_back(zeroIndex);
+
+    // Record the offsets since they are needed to remap the memory accesses of
+    // the original memref further below.
+    fastBufOffsets.push_back(offset);
+  }
 
   // The faster memory space buffer.
   Value fastMemRef, advanceFastMemRef;
@@ -2477,7 +2490,7 @@ LogicalResult mlir::generateCopy(
     AffineMap fastBufferLayout, advanceFastBufferLayout;
     if (hasAdvancedPermutationOrder) {
       int64_t size = 1;
-      for (const auto dim: fastBufferShape) {
+      for (const auto dim : fastBufferShape) {
         size *= dim;
       }
       advanceBufferShape.push_back(size);
@@ -2489,7 +2502,8 @@ LogicalResult mlir::generateCopy(
       // Create the fast memory space buffer just before the 'affine.for'
       // operation.
       advanceFastMemRef =
-          prologue.create<memref::AllocOp>(loc, advanceFastMemRefType).getResult();
+          prologue.create<memref::AllocOp>(loc, advanceFastMemRefType)
+              .getResult();
       fastBufferMap[memref] = advanceFastMemRef;
     } else {
       fastBufferLayout = b.getMultiDimIdentityMap(rank);
@@ -2506,9 +2520,9 @@ LogicalResult mlir::generateCopy(
       // fastMemRefType is a constant shaped memref.
       *sizeInBytes = getMemRefSizeInBytes(fastMemRefType).getValue();
       LLVM_DEBUG(emitRemarkForBlock(*block)
-                << "Creating fast buffer of type " << fastMemRefType
-                << " and size " << llvm::divideCeil(*sizeInBytes, 1024)
-                << " KiB\n");
+                 << "Creating fast buffer of type " << fastMemRefType
+                 << " and size " << llvm::divideCeil(*sizeInBytes, 1024)
+                 << " KiB\n");
     }
   } else {
     // Reuse the one already created.
@@ -2561,8 +2575,8 @@ LogicalResult mlir::generateCopy(
     if (hasAdvancedPermutationOrder) {
       llvm::dbgs() << "Advance Point-wise copy generation\n";
       copyNest = generateAdvancePointWiseCopy(
-          loc, memref, advanceFastMemRef, top.getAffineConstantExpr(0),
-          region.isWrite(), b, valueMapForAdvancedPermutationOrder, forOp,
+          loc, memref, advanceFastMemRef, region.isWrite(), b,
+          valueMapForAdvancedPermutationOrder, forOp,
           copyOptions.fastMemorySpace);
     } else {
       llvm::dbgs() << "Point-wise copy generation\n";
@@ -2580,7 +2594,7 @@ LogicalResult mlir::generateCopy(
     // mark end of block range being processed if necessary.
     if (region.isWrite() && isCopyOutAtEndOfBlock)
       *nEnd = Block::iterator(copyNest.getOperation());
-  } else { // XXX: suppose generateDma is always false
+  } else { // XXX: suppose generateDma is always false for advance permutation
     // DMA generation.
     // Create a tag (single element 1-d memref) for the DMA.
     auto tagMemRefType = MemRefType::get({1}, top.getIntegerType(32), {},
@@ -2622,7 +2636,8 @@ LogicalResult mlir::generateCopy(
 
   // Generate dealloc for the buffer.
   if (!existingBuf) {
-    auto bufDeallocOp = epilogue.create<memref::DeallocOp>(loc, hasAdvancedPermutationOrder ? advanceFastMemRef : fastMemRef);
+    auto bufDeallocOp = epilogue.create<memref::DeallocOp>(
+        loc, hasAdvancedPermutationOrder ? advanceFastMemRef : fastMemRef);
     // When generating pointwise copies, `nEnd' has to be set to deallocOp on
     // the fast buffer (since it marks the new end insertion point).
     if (!copyOptions.generateDma && *nEnd == end && isCopyOutAtEndOfBlock)
@@ -2661,13 +2676,18 @@ LogicalResult mlir::generateCopy(
     prevOfBegin = std::prev(begin);
 
   // *Only* those uses within the range [begin, end) of 'block' are replaced.
-  // (void)replaceAllMemRefUsesWith(memref, fastMemRef,
-  //                                /*extraIndices=*/{}, indexRemap,
-  //                                /*extraOperands=*/regionSymbols,
-  //                                /*symbolOperands=*/{},
-  //                                /*domOpFilter=*/&*begin,
-  //                                /*postDomOpFilter=*/&*postDomFilter);
-  (void)advanceReplaceAllMemRefUsesWith(memref, advanceFastMemRef, &*begin, &*postDomFilter, forOp, copyOptions.fastMemorySpace, region.isWrite());
+  if (hasAdvancedPermutationOrder) {
+    (void)advanceReplaceAllMemRefUsesWith(
+        memref, advanceFastMemRef, &*begin, &*postDomFilter, forOp,
+        copyOptions.fastMemorySpace, region.isWrite());
+  } else {
+    (void)replaceAllMemRefUsesWith(memref, fastMemRef,
+                                   /*extraIndices=*/{}, indexRemap,
+                                   /*extraOperands=*/regionSymbols,
+                                   /*symbolOperands=*/{},
+                                   /*domOpFilter=*/&*begin,
+                                   /*postDomOpFilter=*/&*postDomFilter);
+  }
 
   *nBegin = isBeginAtStartOfBlock ? block->begin() : std::next(prevOfBegin);
 
