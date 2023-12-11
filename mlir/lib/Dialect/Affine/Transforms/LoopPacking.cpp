@@ -490,11 +490,11 @@ static void computeTileShape(Value memRef,
 // }
 
 static LogicalResult generatePackings(
-    Value memRef, Operation *forOp, std::unique_ptr<MemRefRegion> &readRegion,
+    Value memRef, AffineForOp &forOp, std::unique_ptr<MemRefRegion> &readRegion,
     std::unique_ptr<MemRefRegion> &writeRegion,
     DenseSet<Operation *> &copyNests, AffineCopyOptions &copyOptions,
     ArrayRef<size_t> permutationOrder,
-    Optional<AffineValueMap> valueMapForAdvancedPermutationOrder) {
+    Optional<AffineValueMap> &valueMapForAdvancedPermutationOrder) {
   // Map from original memref's to the fast buffers that their accesses are
   // replaced with.
   DenseMap<Value, Value> fastBufferMap;
@@ -521,11 +521,12 @@ static LogicalResult generatePackings(
 
     uint64_t sizeInBytes;
     Block::iterator nBegin, nEnd;
+    LLVM_DEBUG(dbgs() << " generatePackings\n");
     LogicalResult iRet = generateCopy(
         *region, block, begin, end, copyPlacementBlock, copyInPlacementStart,
         copyOutPlacementStart, copyOptions, fastBufferMap, copyNests,
         &sizeInBytes, &nBegin, &nEnd, permutationOrder,
-        valueMapForAdvancedPermutationOrder);
+        valueMapForAdvancedPermutationOrder.hasValue() ? valueMapForAdvancedPermutationOrder.getPointer() : nullptr, &forOp);
     if (succeeded(iRet)) {
       // begin/end could have been invalidated, and need update.
       begin = nBegin;
@@ -1458,6 +1459,7 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
       } else {
         LLVM_DEBUG(dbgs() << "   [DEBUG] Succeeded generating packing"
                           << "\n\n");
+        LLVM_DEBUG(dbgs() << outerForOp << "\n");
       }
     }
   } else /* User selected*/ {
@@ -1529,6 +1531,7 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
       } else {
         LLVM_DEBUG(dbgs() << "   [DEBUG] Succeeded generating packing"
                           << "\n\n");
+        LLVM_DEBUG(dbgs() << outerForOp << "\n");
       }
     }
   }

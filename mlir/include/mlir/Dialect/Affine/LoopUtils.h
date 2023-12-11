@@ -214,7 +214,8 @@ LogicalResult generateCopy(
     DenseSet<Operation *> &copyNests, uint64_t *sizeInBytes,
     Block::iterator *nBegin, Block::iterator *nEnd,
     ArrayRef<size_t> fastBufferPermutationIndex = llvm::None,
-    Optional<AffineValueMap> valueMapForAdvancedPermutationOrder = llvm::None);
+    AffineValueMap *valueMapForAdvancedPermutationOrder = nullptr,
+    AffineForOp *forOp = nullptr);
 
 /// Result for calling generateCopyForMemRegion.
 struct CopyGenerateResult {
