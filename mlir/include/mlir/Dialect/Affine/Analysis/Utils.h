@@ -385,6 +385,33 @@ Optional<int64_t> getMemoryFootprintBytes(AffineForOp forOp,
                                           int memorySpace = -1,
                                           Optional<Value> filterMemRef=llvm::None);
 
+bool isAffineIfOpTopLevelInLoop(AffineIfOp ifOp, AffineForOp forOp);
+
+void getTopLevelAffineIfOpsinAffineForOp(AffineForOp parentForOp, 
+                                         SmallVectorImpl<AffineIfOp> &ifOps);
+
+bool isAffineIfOpTopLevelInAffineIfOp(AffineIfOp ifOp, AffineIfOp parentIfOp);
+
+void getTopLevelAffineIfOpsinAffineIfOp(AffineIfOp parentIfOp,
+                                        SmallVectorImpl<AffineIfOp> &thenIfOps, 
+                                        SmallVectorImpl<AffineIfOp> &elseIfOps);
+
+Optional<int64_t> calculateAffineIfOpMemoryFootprintBytes(AffineIfOp ifOp, 
+                                                          AffineForOp parentForOp, 
+                                                          SmallVector<MemRefRegion, 4> &originalRefs, 
+                                                          Optional<Value> filterMemRef=llvm::None);
+
+Optional<int64_t> getMemoryFootprintBytesWithBranches(AffineForOp forOp,
+                                                      Block &block,
+                                                      Block::iterator start,
+                                                      Block::iterator end,
+                                                      int memorySpace,
+                                                      Optional<Value> filterMemRef=llvm::None);
+
+Optional<int64_t> getMemoryFootprintBytesWithBranches(AffineForOp forOp, 
+                                                      int memorySpace, 
+                                                      Optional<Value> filterMemRef=llvm::None);
+
 
 /// Simplify the integer set by simplifying the underlying affine expressions by
 /// flattening and some simple inference. Also, drop any duplicate constraints.
