@@ -733,6 +733,10 @@ public:
 
       auto footprint = getMemoryFootprintBytes(
           *forBodyBlock, forBodyBlock->begin(), forBodyBlock->end(), 0, memRef);
+
+      LLVM_DEBUG(dbgs() << "[DEBUG] Footprint of " << memRef << ": "
+                        << footprint.getValueOr(0) << "\n");
+          
       if (footprint.hasValue())
         otherMemrefFootprint += 2 * footprint.getValue();
       else
@@ -1210,6 +1214,9 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   // No need for packing if everything already fits in l1 cache
   Optional<int64_t> totalFootprint =
       getMemoryFootprintBytes(outerForOp, /*memorySpace=*/0);
+  
+  LLVM_DEBUG(dbgs() << "[DEBUG] Total footprint: " << totalFootprint.getValueOr(0) << "\n");
+  
   if (!this->ignoreCache && totalFootprint.hasValue() &&
       static_cast<uint64_t>(totalFootprint.getValue()) <
           this->l1CacheSizeInKiB * 1024) {
