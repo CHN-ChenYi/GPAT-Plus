@@ -960,6 +960,24 @@ public:
     return true;
   }
 
+  void updateValueMapForAdvancedPermutationOrder(AffineValueMap &map) {
+    // XXX: suppose there no two loads/stores refers to the same index
+    // Devs can choose not to use #pragma scop and #pragma endscop in a specific
+    // for loop if this assumption is not true
+    if (!this->valueMapForAdvancedPermutationOrder.hasValue()) {
+      this->valueMapForAdvancedPermutationOrder = map;
+    } else {
+      // if the map is different, fallback to index permutation
+      AffineValueMap diff;
+      AffineValueMap::difference(
+          this->valueMapForAdvancedPermutationOrder.getValue(), map, &diff);
+      if (!llvm::all_of(diff.getAffineMap().getResults(),
+                       [](AffineExpr e) { return e == 0; })) {
+        this->valueMapForAdvancedPermutationOrder = None;
+      }
+    }
+  }
+
   void setPermutationOrder() {
     auto rank = this->memRef.getType().cast<MemRefType>().getRank();
 
@@ -971,6 +989,7 @@ public:
         // Give up on non-trivial layout map
         if (!loadOp.getMemRefType().getLayout().isIdentity()) {
           this->permutationOrder = None;
+          this->valueMapForAdvancedPermutationOrder = None;
           return WalkResult::interrupt();
         }
       } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
@@ -979,6 +998,7 @@ public:
         // Give up on non-trivial layout map
         if (!storeOp.getMemRefType().getLayout().isIdentity()) {
           this->permutationOrder = None;
+          this->valueMapForAdvancedPermutationOrder = None;
           return WalkResult::interrupt();
         }
       } else {
@@ -1037,14 +1057,7 @@ public:
         }
       }
 
-      // Update advanced packing exists
-      if (!this->valueMapForAdvancedPermutationOrder.hasValue()) {
-        this->valueMapForAdvancedPermutationOrder = map;
-      } else {
-        // XXX: AffineValueMap::operator!= does not work, so simply suppose the map
-        // must be different if there exist two loads/stores
-        this->valueMapForAdvancedPermutationOrder = None;
-      }
+      updateValueMapForAdvancedPermutationOrder(map);
 
       return WalkResult::advance();
     });
@@ -1073,6 +1086,7 @@ public:
         // Give up on non-trivial layout map
         if (!loadOp.getMemRefType().getLayout().isIdentity()) {
           this->permutationOrder = None;
+          this->valueMapForAdvancedPermutationOrder = None;
           return WalkResult::interrupt();
         }
       } else if (auto storeOp = dyn_cast<AffineStoreOp>(op)) {
@@ -1081,6 +1095,7 @@ public:
         // Give up on non-trivial layout map
         if (!storeOp.getMemRefType().getLayout().isIdentity()) {
           this->permutationOrder = None;
+          this->valueMapForAdvancedPermutationOrder = None;
           return WalkResult::interrupt();
         }
       } else {
@@ -1103,7 +1118,7 @@ public:
             if (isInnermostAffineForOp(ownerForOp) &&
                 this->permutationOrder.getValue()[resultIdx] != resultIdx) {
               this->innermostLoopIVPermutation = true;
-              this->valueMapForAdvancedPermutationOrder = map;
+              updateValueMapForAdvancedPermutationOrder(map);
               return WalkResult::interrupt();
             }
           }

@@ -2059,6 +2059,8 @@ static AffineForOp generateAdvancePointWiseCopy(
 
   // delete all operations except loop headers, terminator and memref
   // loops has no reverse iterator
+  // TODO(permutation): buggy (some operations in the body of a middle loop is
+  // not deleted)
   std::deque<Operation *> reverse_body;
   for (auto &op : loops.back())
     reverse_body.push_front(&op);
