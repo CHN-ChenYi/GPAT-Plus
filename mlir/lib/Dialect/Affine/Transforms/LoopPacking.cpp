@@ -731,8 +731,12 @@ public:
       if (this->memRef == memRef)
         continue;
 
-      auto footprint = getMemoryFootprintBytesWithBranches(
+      auto footprint = getMemoryFootprintBytesWithBranches(this->loop->forOp,
           *forBodyBlock, forBodyBlock->begin(), forBodyBlock->end(), 0, memRef);
+
+      LLVM_DEBUG(dbgs() << "[DEBUG] Footprint of " << memRef << ": "
+                        << footprint.getValueOr(0) << "\n");
+                    
       if (footprint.hasValue())
         otherMemrefFootprint += 2 * footprint.getValue();
       else
@@ -1104,6 +1108,8 @@ public:
 /// Analyse and apply packing to a loop and its nestings.
 void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
                                   DenseSet<Operation *> &copyNests) {
+  LLVM_DEBUG(dbgs() << "\n[DEBUG] Now Running IF Analysis" << "\n");
+                                    
   // Skip copy forOps
   if (copyNests.count(outerForOp) != 0)
     return;
@@ -1210,6 +1216,9 @@ void LoopPacking::runOnOuterForOp(AffineForOp outerForOp,
   // No need for packing if everything already fits in l1 cache
   Optional<int64_t> totalFootprint =
       getMemoryFootprintBytesWithBranches(outerForOp, /*memorySpace=*/0);
+  
+  LLVM_DEBUG(dbgs() << "[DEBUG] Total footprint: " << totalFootprint.getValueOr(0) << "\n");
+    
   if (!this->ignoreCache && totalFootprint.hasValue() &&
       static_cast<uint64_t>(totalFootprint.getValue()) <
           this->l1CacheSizeInKiB * 1024) {
