@@ -1347,6 +1347,539 @@ Optional<int64_t> mlir::getMemoryFootprintBytes(AffineForOp forOp,
       std::next(Block::iterator(forInst)), memorySpace, filterMemRef);
 }
 
+bool mlir::isAffineIfOpTopLevelInLoop(AffineIfOp ifOp, AffineForOp forOp) {
+  // Check if the operation is inside an AffineIfOp that is also inside the
+  // outermost loop
+  Operation *parent = ifOp.getOperation()->getParentOp();
+  while (parent != nullptr && parent != forOp.getOperation()) {
+    if (isa<AffineIfOp>(parent)) {
+      return false;
+    }
+    parent = parent->getParentOp();
+  }
+  return true;
+}
+
+void mlir::getTopLevelAffineIfOpsinAffineForOp(AffineForOp parentForOp, SmallVectorImpl<AffineIfOp> &ifOps) {
+    // Lambda function to walk through a region and collect top-level AffineIfOps
+    parentForOp.walk([&](AffineIfOp ifOp) {
+        if (isAffineIfOpTopLevelInLoop(ifOp, parentForOp)) {
+            ifOps.push_back(std::move(ifOp));
+        }
+    });
+}
+
+bool mlir::isAffineIfOpTopLevelInAffineIfOp(AffineIfOp ifOp, AffineIfOp parentIfOp) {
+  Operation *parent = ifOp.getOperation()->getParentOp();
+  while (parent != nullptr && parent != parentIfOp.getOperation()) {
+    if (isa<AffineIfOp>(parent)) {
+      return false;
+    }
+    parent = parent->getParentOp();
+  }
+  return true;
+}
+
+void mlir::getTopLevelAffineIfOpsinAffineIfOp(AffineIfOp parentIfOp, SmallVectorImpl<AffineIfOp> &thenIfOps, SmallVectorImpl<AffineIfOp> &elseIfOps) {
+    // Collect top-level AffineIfOps from the 'then' region
+    parentIfOp.thenRegion().walk([&](AffineIfOp ifOp) {
+        if (isAffineIfOpTopLevelInAffineIfOp(ifOp, parentIfOp)) {
+            thenIfOps.push_back(std::move(ifOp));
+        }
+    });
+
+    // Collect top-level AffineIfOps from the 'else' region, if it exists
+    if (!parentIfOp.elseRegion().empty()) {
+      parentIfOp.elseRegion().walk([&](AffineIfOp ifOp) {
+          if (isAffineIfOpTopLevelInAffineIfOp(ifOp, parentIfOp)) {
+              elseIfOps.push_back(std::move(ifOp));
+          }
+      });
+    }
+}
+
+Optional<int64_t> mlir::calculateAffineIfOpMemoryFootprintBytes(AffineIfOp ifOp, AffineForOp parentForOp, SmallVector<MemRefRegion, 4> &originalRefs, Optional<Value> filterMemRef) {
+  /*
+    aegs: 
+      ifOp: the AffineIfOp to calculate the memory footprint
+      parentForOp: the AffineForOp that contains the AffineIfOp, this is needed to calculate the loop depth and the region memory footprint
+      originalRefs: the vector of MemRefRegion that stores the original regions before merging
+      filterMemRef: the memref to filter
+
+    return:
+      the memory footprint of the AffineIfOp, this is intended to be used only when deciding which children to take
+  */
+  
+  // childIfOps is a vector of AffineIfOps that are top-level in the current AffineIfOp
+  SmallVector<AffineIfOp, 4> childThenIfOps;
+  SmallVector<AffineIfOp, 4> childElseIfOps;
+  getTopLevelAffineIfOpsinAffineIfOp(ifOp, childThenIfOps, childElseIfOps);
+
+  auto calculateAbsoluteMemoryFootprintBytes = [&](Region &parentRegion, SmallVector<MemRefRegion, 4> &consideredParentRegions, Optional<Value> filterMemRef) -> Optional<int64_t> {
+    SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> regions;
+
+    // Walk this 'affine.for' operation to gather all memory regions.
+    auto result = parentRegion.walk([&](Operation *opInst) -> WalkResult {
+      // Filter by memrefs if FilterMemRef was specified
+      if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+        if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+          return WalkResult::advance();
+        }
+      } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+        if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+          return WalkResult::advance();
+        }
+      } else if (isa<AffineIfOp>(opInst)) {
+        // fail if we encounter an AffineIfOp, as this should never happen
+        return opInst->emitError("calculateAbsoluteMemoryFootprintBytes: encountered an AffineIfOp");
+      } else {
+        // Neither load nor a store op.
+        return WalkResult::advance();
+      }
+
+      // Compute the memref region symbolic in any IVs enclosing this block.
+      auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
+      if (failed(
+              region->compute(opInst,
+                              /*loopDepth=*/getNestingDepth(parentForOp.getOperation())))) {
+        return opInst->emitError("error obtaining memory region\n");
+      }
+
+      // first make a copy of the region object and store it in the originalRefs vector
+      consideredParentRegions.push_back(*region);
+
+      auto it = regions.find(region->memref);
+      if (it == regions.end()) {
+        regions[region->memref] = std::move(region);
+      } else if (failed(it->second->unionBoundingBox(*region))) {
+        return opInst->emitWarning(
+            "getMemoryFootprintBytes: unable to perform a union on a memory "
+            "region");
+      }
+      return WalkResult::advance();
+    });
+
+    if (result.wasInterrupted())
+      return None;
+
+    int64_t totalSizeInBytes = 0;
+
+    for (const auto &region : regions) {
+      Optional<int64_t> size = region.second->getRegionSize();
+      if (!size.hasValue())
+        return None;
+      totalSizeInBytes += size.getValue();
+    }
+
+    return totalSizeInBytes;
+  };
+
+  // base case: there is no child AffineIfOp, calculate the max between then and else regions footprint
+  if (childThenIfOps.empty() && childElseIfOps.empty()) {
+    // 1. calculate the footprint of the then region
+    SmallVector<MemRefRegion, 4> thenOriginalRegions;
+    SmallVector<MemRefRegion, 4> elseOriginalRegions;
+
+    Optional<int64_t> thenFootprintOpt = calculateAbsoluteMemoryFootprintBytes(ifOp.thenRegion(), thenOriginalRegions, filterMemRef);
+    if (!thenFootprintOpt.hasValue()) {
+        // Handle the error or absence of a value
+        return llvm::None; // Or your preferred error handling
+    }
+    int64_t thenFootprint = thenFootprintOpt.getValue();
+
+    int64_t elseFootprint = 0;
+    if (!ifOp.elseRegion().empty()) {
+    Optional<int64_t> elseFootprintOpt = calculateAbsoluteMemoryFootprintBytes(ifOp.elseRegion(), elseOriginalRegions, filterMemRef);
+    if (!elseFootprintOpt.hasValue()) {
+        // Handle the error or absence of a value
+        return llvm::None; // Or your preferred error handling
+    }
+    elseFootprint = elseFootprintOpt.getValue();
+  }
+    if (thenFootprint > elseFootprint) {
+      // 3. return the footprint of the then region
+      for (auto region : thenOriginalRegions) {
+        originalRefs.push_back(region);
+      }
+      return thenFootprint;
+    } else {
+      // 3. return the footprint of the else region
+      for (auto region : elseOriginalRegions) {
+        originalRefs.push_back(region);
+      }
+      return elseFootprint;
+    }
+  }
+
+
+  // process the then region
+  SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> thenRegions;
+  SmallVector<MemRefRegion, 4> thenOriginalRefs;
+  auto result = ifOp.thenRegion().walk([&](Operation *opInst) {
+    // Filter by memrefs if FilterMemRef was specified
+    if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+      if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+      if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else {
+      // Neither load nor a store op.
+      return WalkResult::advance();
+    }
+
+    // if the operation is inside an AffineIfOp which is not a child of the current AffineIfOp, skip it
+    if (opInst->getParentOfType<AffineIfOp>() != nullptr && 
+        ifOp.getOperation()->isProperAncestor(opInst->getParentOfType<AffineIfOp>())) {
+      LLVM_DEBUG(llvm::dbgs() << "skipping operation: " << *opInst << "\n");
+      return WalkResult::advance();
+    }
+
+    // Compute the memref region symbolic in any IVs enclosing this block.
+    auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
+    if (failed(
+            region->compute(opInst,
+                            /*loopDepth=*/getNestingDepth(parentForOp.getOperation())))) {
+      opInst->emitError("error obtaining memory region\n");
+      return WalkResult::interrupt();
+    }
+
+    // first make a copy of the region object and store it in the originalRefs vector
+    thenOriginalRefs.push_back(*region);
+
+    auto it = thenRegions.find(region->memref);
+    if (it == thenRegions.end()) {
+      thenRegions[region->memref] = std::move(region);
+    } else if (failed(it->second->unionBoundingBox(*region))) {
+      opInst->emitWarning(
+          "getMemoryFootprintBytes: unable to perform a union on a memory "
+          "region");
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  
+  if (result.wasInterrupted())
+    return None;
+
+  int64_t maxThenFootprint = 0;
+  // traverse all the child AffineIfOps, an index is used to keep track of the child AffineIfOp that yields the max footprint
+  int maxThenFootprintIndex = -1;
+  SmallVector<MemRefRegion, 4> maxThenChildOriginalRefs;
+  for (size_t i = 0; i < childThenIfOps.size(); i++) {
+    // 1. calculate the footprint of the child AffineIfOp
+    // 2. if the footprint is greater than the current max footprint, update the max footprint and the index
+    // 3. add the regions of the child AffineIfOp to the originalRefs vector
+    SmallVector<MemRefRegion, 4> childOriginalRefs;
+    calculateAffineIfOpMemoryFootprintBytes(childThenIfOps[i], parentForOp, childOriginalRefs, filterMemRef);
+    int64_t footprint = 0;
+    // first, make a copy of the thenRegions vector
+    SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> thenRegionsCopy;
+    // TODO: 
+    for (auto &it: thenRegions) {
+      // make a copy of the region object
+      MemRefRegion copiedRegion = *it.second;
+      thenRegionsCopy[it.first] = std::make_unique<MemRefRegion>(std::move(copiedRegion));
+    }
+
+    for (auto &region : childOriginalRefs) {
+      auto it = thenRegionsCopy.find(region.memref);
+      if (it == thenRegionsCopy.end()) {
+        MemRefRegion copiedRegion = region;
+        thenRegionsCopy[region.memref] = std::make_unique<MemRefRegion>(std::move(copiedRegion));
+      } else if (failed(it->second->unionBoundingBox(region))) {
+        LLVM_DEBUG(llvm::dbgs() << "getMemoryFootprintBytes: unable to perform a union on a memory region");
+        return None;
+      }
+    }
+    for (const auto &region : thenRegionsCopy) {
+      Optional<int64_t> size = region.second->getRegionSize();
+      if (!size.hasValue())
+        return None;
+      footprint += size.getValue();
+    }
+
+    if (footprint > maxThenFootprint) {
+      maxThenFootprint = footprint;
+      maxThenFootprintIndex = i;
+      maxThenChildOriginalRefs = childOriginalRefs;
+    }
+  }  
+
+  if (maxThenFootprintIndex == -1) {
+    // no child AffineIfOp yields a footprint greater than 0, return 0
+    maxThenFootprint = 0;
+    for (const auto &region : thenRegions) {
+      Optional<int64_t> size = region.second->getRegionSize();
+      if (!size.hasValue())
+        return None;
+      maxThenFootprint += size.getValue();
+    }
+  }
+
+  if (childElseIfOps.empty() != true) {
+    // process the else region
+    SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> elseRegions;
+    SmallVector<MemRefRegion, 4> elseOriginalRefs;
+    auto result = ifOp.elseRegion().walk([&](Operation *opInst) {
+      // Filter by memrefs if FilterMemRef was specified
+      if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+        if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+          return WalkResult::advance();
+        }
+      } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+        if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+          return WalkResult::advance();
+        }
+      } else {
+        // Neither load nor a store op.
+        return WalkResult::advance();
+      }
+
+      // if the operation is inside an AffineIfOp which is not a child of the current AffineIfOp, skip it
+      if (opInst->getParentOfType<AffineIfOp>() != nullptr && 
+          ifOp.getOperation()->isProperAncestor(opInst->getParentOfType<AffineIfOp>())) {
+        LLVM_DEBUG(llvm::dbgs() << "skipping operation: " << *opInst << "\n");
+        return WalkResult::advance();
+      }
+
+      // Compute the memref region symbolic in any IVs enclosing this block.
+      auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
+      if (failed(
+              region->compute(opInst,
+                              /*loopDepth=*/getNestingDepth(parentForOp.getOperation())))) {
+        opInst->emitError("error obtaining memory region\n");
+        return WalkResult::interrupt();
+      }
+
+      // first make a copy of the region object and store it in the originalRefs vector
+      elseOriginalRefs.push_back(*region);
+
+      auto it = elseRegions.find(region->memref);
+      if (it == elseRegions.end()) {
+        thenRegions[region->memref] = std::move(region);
+      } else if (failed(it->second->unionBoundingBox(*region))) {
+        opInst->emitWarning(
+            "getMemoryFootprintBytes: unable to perform a union on a memory "
+            "region");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+
+    if (result.wasInterrupted())
+      return None;
+
+    // traverse all the child AffineIfOps, an index is used to keep track of the child AffineIfOp that yields the max footprint
+    int64_t maxElseFootprint = 0;
+    int maxElseFootprintIndex = -1;
+    SmallVector<MemRefRegion, 4> maxElseChildOriginalRefs;
+    for (size_t i = 0; i < childElseIfOps.size(); i++) {
+      // 1. calculate the footprint of the child AffineIfOp
+      // 2. if the footprint is greater than the current max footprint, update the max footprint and the index
+      // 3. add the regions of the child AffineIfOp to the originalRefs vector
+      SmallVector<MemRefRegion, 4> childOriginalRefs;
+      calculateAffineIfOpMemoryFootprintBytes(childElseIfOps[i], parentForOp, childOriginalRefs, filterMemRef);
+      int64_t footprint = 0;
+      // first, make a copy of the elseRegions vector
+      SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> elseRegionsCopy;
+      // TODO:
+      for (auto &it: elseRegions) {
+        // make a copy of the region object
+        MemRefRegion copiedRegion = *it.second;
+        elseRegionsCopy[it.first] = std::make_unique<MemRefRegion>(std::move(copiedRegion));
+      }
+      
+      for (auto &region : childOriginalRefs) {
+        auto it = elseRegionsCopy.find(region.memref);
+        if (it == elseRegionsCopy.end()) {
+          MemRefRegion copiedRegion = region;
+          elseRegionsCopy[region.memref] = std::make_unique<MemRefRegion>(std::move(copiedRegion));
+        } else if (failed(it->second->unionBoundingBox(region))) {
+          LLVM_DEBUG(llvm::dbgs() << "getMemoryFootprintBytes: unable to perform a union on a memory region");
+          return None;
+        }
+      }
+      for (const auto &region : elseRegionsCopy) {
+        Optional<int64_t> size = region.second->getRegionSize();
+        if (!size.hasValue())
+          return None;
+        footprint += size.getValue();
+      }
+
+      if (footprint > maxElseFootprint) {
+        maxElseFootprint = footprint;
+        maxElseFootprintIndex = i;
+        maxElseChildOriginalRefs = childOriginalRefs;
+      }
+    }
+
+    if (maxElseFootprintIndex == -1) {
+      // no child AffineIfOp yields a footprint greater than 0, return 0
+      maxElseFootprint = 0;
+      for (const auto &region : elseRegions) {
+        Optional<int64_t> size = region.second->getRegionSize();
+        if (!size.hasValue())
+          return None;
+        maxElseFootprint += size.getValue();
+      }
+    }
+
+
+    // return the max between the then and else regions
+    if (maxThenFootprint > maxElseFootprint) {
+      // return the footprint of the then region
+      for (auto region : thenOriginalRefs) {
+        originalRefs.push_back(region);
+      }
+      for (auto region : maxThenChildOriginalRefs) {
+        originalRefs.push_back(region);
+      }
+      return maxThenFootprint;
+    } else {
+      // return the footprint of the else region
+      for (auto region : elseOriginalRefs) {
+        originalRefs.push_back(region);
+      }
+      for (auto region : maxElseChildOriginalRefs) {
+        originalRefs.push_back(region);
+      }
+      return maxElseFootprint;
+    }
+  }
+
+  // no else region, return the footprint of the then region
+  for (auto region : thenOriginalRefs) {
+    originalRefs.push_back(region);
+  }
+  for (auto region : maxThenChildOriginalRefs) {
+    originalRefs.push_back(region);
+  }  
+  return maxThenFootprint;
+}
+
+Optional<int64_t> mlir::getMemoryFootprintBytesWithBranches(
+                                                AffineForOp forOp,
+                                                Block &block,
+                                                Block::iterator start,
+                                                Block::iterator end,
+                                                int memorySpace,
+                                                Optional<Value> filterMemRef) {
+
+  // test cout
+  LLVM_DEBUG(llvm::dbgs() << "[DEBUG 12] running getMemoryFootprintBytesWithBranches 123\n");
+  //print out block information
+
+  LLVM_DEBUG(llvm::dbgs() << "[DEBUG] block: 123 " << block.empty() << "\n");
+  // LLVM_DEBUG(llvm::dbgs() << "[DEBUG] start: 123\n");
+  SmallDenseMap<Value, std::unique_ptr<MemRefRegion>, 4> regions;
+
+  LLVM_DEBUG(llvm::dbgs() << "[DEBUG 14] start walking affine.for" << "\n");
+  // Walk this `affine.for` operation
+  auto result = block.walk(start, end, [&](Operation *opInst) -> WalkResult {
+  // auto result = block.walk([&](Operation *opInst) -> WalkResult {
+    // Filter by memrefs if FilterMemRef was specified
+
+    LLVM_DEBUG(llvm::dbgs() << "[DEBUG walk] encountered opInst\n");
+    if (auto loadOp = dyn_cast<AffineReadOpInterface>(opInst)) {
+      if (filterMemRef.hasValue() && filterMemRef != loadOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else if (auto storeOp = dyn_cast<AffineWriteOpInterface>(opInst)) {
+      if (filterMemRef.hasValue() && filterMemRef != storeOp.getMemRef()) {
+        return WalkResult::advance();
+      }
+    } else {
+      // Neither load nor a store op.
+      return WalkResult::advance();
+    }
+
+    LLVM_DEBUG(llvm::dbgs() << "[DEBUG walk] opInst is a load or store op: " << *opInst << "\n");
+    if (opInst->getParentOfType<AffineIfOp>() != nullptr && 
+        forOp.getOperation()->isProperAncestor(opInst->getParentOfType<AffineIfOp>())) {
+      // Skip operations that are inside an AffineIfOp within the loop
+      LLVM_DEBUG(llvm::dbgs() << "skipping operation as it is in an AffineIfOp: " << *opInst << "\n");
+      return WalkResult::advance();
+    }
+
+    // Compute the memref region symbolic in any IVs enclosing this block.
+    auto region = std::make_unique<MemRefRegion>(opInst->getLoc());
+    if (failed (
+            region->compute(opInst,
+                            /*loopDepth=*/getNestingDepth(&*block.begin())))) {
+      return opInst->emitError("error obtaining memory region\n");
+    }
+
+    regions[region->memref] = std::move(region);
+    return WalkResult::advance();
+  });
+
+  if (result.wasInterrupted())
+    return None;
+
+  LLVM_DEBUG(llvm::dbgs() << "[DEBUG] finished walking affine.for" << "\n");
+
+  // now, walk all the ifOps inside the block
+  // TODO: initialize data structures
+  SmallVector<AffineIfOp, 4> ifOps;
+  SmallVector<MemRefRegion, 4> maxIfOpOriginalRefs;
+  int64_t maxIfFootprint = 0;
+  getTopLevelAffineIfOpsinAffineForOp(forOp, ifOps);
+  for (auto ifOp : ifOps) {
+    LLVM_DEBUG(llvm::dbgs() << "ifOp: " << *ifOp << "\n");
+
+    // start processing: for each ifOp, calculate the naive memory footprint 
+    // (we do not merge regions inside the ifOp with other regions outside the ifOp yet)
+    SmallVector<MemRefRegion, 4> ifOpOriginalRefs;
+    Optional<int64_t> ifFootprintOpt = calculateAffineIfOpMemoryFootprintBytes(ifOp, forOp, ifOpOriginalRefs, filterMemRef);
+    if (!ifFootprintOpt.hasValue()) {
+        // Handle the error or absence of a value
+        return llvm::None; // Or your preferred error handling
+    }
+    int64_t ifFootprint = ifFootprintOpt.getValue();
+    if (ifFootprint > maxIfFootprint) {
+      maxIfFootprint = ifFootprint;
+      maxIfOpOriginalRefs = ifOpOriginalRefs;
+    }
+  }
+
+  if (maxIfFootprint > 0) {
+    // if there is at least one ifOp, merge the regions inside the ifOp with the regions outside the ifOp
+    for (auto &region : maxIfOpOriginalRefs) {
+      // NOTE: we should have already computed sizes for the regions inside the ifOp
+      auto it = regions.find(region.memref);
+      if (it == regions.end()) {
+        MemRefRegion copiedRegion = region;
+        regions[region.memref] = std::make_unique<MemRefRegion>(std::move(copiedRegion));
+      } else if (failed(it->second->unionBoundingBox(region))) {
+        LLVM_DEBUG(llvm::dbgs() << "getMemoryFootprintBytes: unable to perform a union on a memory region");
+        return None;
+      }
+    }
+  }
+
+  int64_t totalSizeInBytes = 0;
+  for (const auto &region : regions) {
+    Optional<int64_t> size = region.second->getRegionSize();
+    if (!size.hasValue())
+      return None;
+    totalSizeInBytes += size.getValue();
+  }
+
+  return totalSizeInBytes;
+}
+
+Optional<int64_t> mlir::getMemoryFootprintBytesWithBranches(
+    AffineForOp forOp, int memorySpace, Optional<Value> filterMemRef) {
+  auto *forInst = forOp.getOperation();
+  return ::getMemoryFootprintBytesWithBranches(forOp, *forInst->getBlock(), 
+                                   Block::iterator(forInst),
+                                   std::next(Block::iterator(forInst)),
+                                   memorySpace, filterMemRef);
+}
+
 /// Returns whether a loop is parallel and contains a reduction loop.
 bool mlir::isLoopParallelAndContainsReduction(AffineForOp forOp) {
   SmallVector<LoopReduction> reductions;
